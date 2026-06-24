@@ -88,10 +88,26 @@ async function joinChannel(channelId, guildId, adapterCreator) {
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     console.log('Disconnected. Attempting to reconnect...');
     try {
-      await entersState(connection, VoiceConnectionStatus.Signalling, 5_000);
+      // If Discord is simply moving us between states, wait for it to settle.
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+      // Recovered — no further action needed.
     } catch {
-      try { connection.rejoin(); } catch (err) {
-        console.error('Rejoin failed:', err.message);
+      // Truly disconnected (kicked, network drop, etc.) — destroy and rebuild.
+      console.log('Could not recover connection. Rebuilding from scratch...');
+      connection.destroy();
+      if (GUILD_ID && CHANNEL_ID) {
+        setTimeout(async () => {
+          try {
+            const guild = await client.guilds.fetch(GUILD_ID);
+            await joinChannel(CHANNEL_ID, GUILD_ID, guild.voiceAdapterCreator);
+            console.log('Rejoined voice channel after disconnect.');
+          } catch (err) {
+            console.error('Rejoin failed:', err.message);
+          }
+        }, 5_000);
       }
     }
   });
@@ -128,16 +144,25 @@ client.on('interactionCreate', async (interaction) => {
     const member = interaction.member;
     const voiceChannel = member?.voice?.channel;
 
-    if (!voiceChannel) {
-      return interaction.reply({ content: 'You need to be in a voice channel first!', ephemeral: true });
+    // Prefer the channel the user is currently in; fall back to the configured CHANNEL_ID.
+    let targetChannelId = voiceChannel?.id ?? CHANNEL_ID;
+    let targetGuildId   = voiceChannel?.guild?.id ?? interaction.guildId;
+
+    if (!targetChannelId) {
+      return interaction.reply({
+        content: 'No target channel found. Either join a voice channel yourself, or set the CHANNEL_ID environment variable.',
+        ephemeral: true,
+      });
     }
 
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      await joinChannel(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
-      console.log(`Joined voice channel: ${voiceChannel.name}`);
-      await interaction.editReply(`Joined **${voiceChannel.name}**!`);
+      const guild = await client.guilds.fetch(targetGuildId);
+      await joinChannel(targetChannelId, targetGuildId, guild.voiceAdapterCreator);
+      const channelName = voiceChannel?.name ?? `<#${targetChannelId}>`;
+      console.log(`Joined voice channel: ${channelName}`);
+      await interaction.editReply(`Joined **${channelName}**!`);
     } catch (err) {
       console.error('Failed to join channel:', err.message);
       await interaction.editReply('Failed to join the voice channel. Check my permissions.');
